@@ -1,0 +1,96 @@
+#!/bin/bash
+
+set -e
+
+export PATH=/opt/bin:$PATH
+export KUBECONFIG=/etc/kubernetes/admin.conf
+source /var/run/metadata/coreos
+
+_wait_for_pods(){
+    not_ready=true
+    while $not_ready; do
+        for row in $(kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get pod -l k8s-app=$${1} -ojson -n kube-system | jq -r '.items | .[] | @base64'); do
+            phase=$(echo $${row} | base64 --decode | jq -r '.status.phase')
+            if [[ $phase == "Running" ]]; then
+                not_ready=false
+            else
+                not_ready=true
+            fi
+        done
+        sleep 5
+    done
+}
+
+# TODO: handle the case when the seed is destroyed and recreated, or kubeadm will try to init twice.
+# TODO: etcd should recover from a complete loss of a member (i.e. a master node gets destroyed and recreated).
+# Initialize the cluster
+master() {
+    if [[ $${COREOS_EC2_IPV4_LOCAL} == ${join_endpoint} ]]; then
+        kubeadm init --config /etc/kubernetes/kubeadm.yaml
+
+        # Deploy pod network
+        kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/v0.10.0/Documentation/kube-flannel.yml
+        kubectl --namespace kube-system patch ds/kube-flannel-ds -p '{"spec": {"template": {"spec": {"tolerations": [{"key": "node-role.kubernetes.io/master", "operator": "Exists", "effect": "NoSchedule"}, {"key": "dedicated", "value": "ingress", "effect": "NoSchedule"}]}}}}'
+        kubectl --namespace kube-system patch ds/kube-proxy -p '{"spec": {"template": {"spec": {"tolerations": [{"key": "node-role.kubernetes.io/master", "operator": "Exists", "effect": "NoSchedule"}, {"key": "dedicated", "value": "ingress", "effect": "NoSchedule"}]}}}}'
+
+        # Deploy API server ingress controller
+        kubectl apply -f /etc/kubernetes/ingress-controller.yaml
+        kubectl apply -f /etc/kubernetes/ingress.yaml
+        echo "Waiting for the API server ingress controller DaemonSet to become available"
+        while [ $(kubectl get ds nginx-ingress-controller -ojson -n kube-system | jq .status.numberReady) != ${master_count} ]; do sleep 5; done
+
+        # Update kube-proxy ConfigMap
+        kubectl get configmap -n kube-system kube-proxy -o yaml | sed 's#server:.*#server: https://${cluster_dns}#g' | kubectl apply --force -f -
+        kubectl delete pod -n kube-system -l k8s-app=kube-proxy
+        echo "Waiting for kube-proxy to restart"
+        while [ $(kubectl get ds kube-proxy -ojson -n kube-system | jq .status.numberReady) != ${master_count} ]; do sleep 5; done
+
+        # Update kube-controller-manager kubeconfig
+        kubectl get secret controller-manager.conf -ojson -n kube-system | jq '.data."controller-manager.conf"' -r | base64 -d | sed 's#server:.*#server: https://${cluster_dns}#g' > controller-manager.conf
+        kubectl get secret controller-manager.conf -ojson -n kube-system | jq ".data.\"controller-manager.conf\"=\"$(cat controller-manager.conf | base64 | tr -d '\n')\"" | kubectl apply --force -f -
+        kubectl patch ds self-hosted-kube-controller-manager -n kube-system -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"date\":\"`date +'%s'`\"}}}}}"
+
+        # Update kube-scheduler kubeconfig
+        kubectl get secret scheduler.conf -ojson -n kube-system | jq '.data."scheduler.conf"' -r | base64 -d | sed 's#server:.*#server: https://${cluster_dns}#g' > scheduler.conf
+        kubectl get secret scheduler.conf -ojson -n kube-system | jq ".data.\"scheduler.conf\"=\"$(cat scheduler.conf | base64 | tr -d '\n')\"" | kubectl apply --force -f -
+        kubectl patch ds self-hosted-kube-scheduler -n kube-system -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"date\":\"`date +'%s'`\"}}}}}"
+
+        # Update the admin kubeconfig
+        sed -i 's#server:.*#server: https://${cluster_dns}#g' /etc/kubernetes/admin.conf
+    else
+        kubeadm join \
+            --token=${kubernetes_token_id}.${kubernetes_token_secret} \
+            --discovery-token-unsafe-skip-ca-verification \
+            ${join_endpoint}:${join_endpoint_port}
+
+        echo "Waiting for kube-controller-manager to become available"
+        _wait_for_pods "self-hosted-kube-controller-manager"
+
+        echo "Waiting for kube-scheduler to become available"
+        _wait_for_pods "self-hosted-kube-scheduler"
+    fi
+}
+
+worker() {
+    kubeadm join \
+        --token=${kubernetes_token_id}.${kubernetes_token_secret} \
+        --discovery-token-unsafe-skip-ca-verification \
+        ${join_endpoint}:${join_endpoint_port}
+}
+
+mkdir -p /etc/kubernetes
+
+# Install Kubernetes binaries
+docker run --rm -v /opt:/opt -v /etc/kubernetes:/kubernetes autonomy/kubernetes:${kubernetes_version}
+
+mkdir -p /opt/libexec/kubernetes/kubelet-plugins/volume/exec
+
+# Execute the function
+${type}
+
+# Update kubelet kubeconfig
+while [ ! -f /etc/kubernetes/kubelet.conf ]; do sleep 5; done
+sed -i 's#server:.*#server: https://${cluster_dns}#g' /etc/kubernetes/kubelet.conf
+systemctl restart kubelet
+
+exit 0
